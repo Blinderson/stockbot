@@ -1,4 +1,4 @@
-import psycopg2
+import psycopg
 import os
 import json
 from datetime import datetime
@@ -24,9 +24,8 @@ class Database:
                     logger.error("❌ DATABASE_URL не найден в переменных окружения")
                     return
                 
-                self.conn = psycopg2.connect(database_url)
-                self.conn.autocommit = False
-                logger.info("✅ Успешное подключение к PostgreSQL")
+                self.conn = psycopg.connect(database_url)
+                logger.info("✅ Успешное подключение к PostgreSQL с psycopg3")
                 break
                 
             except Exception as e:
