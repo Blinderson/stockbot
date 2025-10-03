@@ -1,3 +1,5 @@
+from flask import Flask
+import threading
 import requests
 import time
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,6 +11,28 @@ import re
 from datetime import datetime, timedelta
 import json
 import os
+
+# Health check сервер
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "✅ Bot is alive and running!"
+
+@app.route('/health')
+def health():
+    return "🟢 OK"
+
+def run_health_server():
+    try:
+        print("🏥 Starting health check server on port 8080...")
+        app.run(host='0.0.0.0', port=8080, debug=False)
+    except Exception as e:
+        print(f"❌ Health server error: {e}")
+
+# Запускаем health сервер в отдельном потоке
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # === НАСТРОЙКИ ===
 DISCORD_CHANNEL_ID = "1407975317682917457"
