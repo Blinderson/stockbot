@@ -1,1 +1,1 @@
-worker: python fixed4.py
+web: python fixed4.py
