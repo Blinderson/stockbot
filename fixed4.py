@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 import json
 import os
 
+# Импортируем нашу БД
+from database import db
+
 # Health check сервер
 app = Flask(__name__)
 
@@ -22,6 +25,16 @@ def health_check():
 @app.route('/health')
 def health():
     return "🟢 OK"
+
+@app.route('/stats')
+def stats_api():
+    """API для статистики"""
+    stats = db.get_user_stats()
+    return {
+        "total_users": stats.get('total_users', 0),
+        "users_with_settings": stats.get('users_with_settings', 0),
+        "status": "running"
+    }
 
 def run_health_server():
     try:
@@ -78,12 +91,8 @@ RARITY_ORDER = ["RARE", "EPIC", "LEGENDARY", "MYTHIC", "GODLY", "SECRET"]
 current_stock = {}
 last_restock_time = None
 last_message_id = None
-last_stock_message_id = None  # ID последнего сообщения о стоке
+last_stock_message_id = None
 user_chat_ids = set()
-
-# Файлы для сохранения данных
-USERS_FILE = "users.json"
-SETTINGS_FILE = "user_settings.json"
 
 # === TELEGRAM БОТ ===
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -98,70 +107,26 @@ keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === СИСТЕМА НАСТРОЕК ПОЛЬЗОВАТЕЛЕЙ ===
-def load_settings():
-    """Загружает настройки пользователей из файла"""
-    try:
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"❌ Ошибка загрузки настроек: {e}")
-    return {}
-
-def save_settings(settings):
-    """Сохраняет настройки пользователей в файл"""
-    try:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"❌ Ошибка сохранения настроек: {e}")
-
+# === СИСТЕМА НАСТРОЕК ПОЛЬЗОВАТЕЛЕЙ (ЧЕРЕЗ БД) ===
 def get_user_settings(user_id):
-    """Получает настройки пользователя"""
-    settings = load_settings()
-    if str(user_id) not in settings:
-        settings[str(user_id)] = {
-            "ignored_rarities": [],
-            "created_at": datetime.now().isoformat()
-        }
-        save_settings(settings)
-    return settings[str(user_id)]
+    """Получает настройки пользователя из БД"""
+    return db.get_user_settings(user_id)
 
 def update_user_settings(user_id, new_settings):
-    """Обновляет настройки пользователя"""
-    settings = load_settings()
-    settings[str(user_id)] = new_settings
-    save_settings(settings)
+    """Обновляет настройки пользователя в БД"""
+    return db.update_user_settings(user_id, new_settings)
 
-def filter_stock_by_settings(stock_data, ignored_rarities):
-    """Фильтрует сток по игнорируемым редкостям"""
-    if not ignored_rarities:
-        return stock_data
-    
-    filtered_stock = {}
-    for plant, stock in stock_data.items():
-        rarity = PLANTS_RARITY.get(plant)
-        if rarity not in ignored_rarities:
-            filtered_stock[plant] = stock
-    
-    return filtered_stock
+def load_users():
+    """Загружает пользователей из БД"""
+    global user_chat_ids
+    user_chat_ids = set(db.get_all_users())
+    print(f"📊 Загружено {len(user_chat_ids)} пользователей из БД")
 
-def should_notify_user(stock_data, ignored_rarities):
-    """Определяет, нужно ли уведомлять пользователя"""
-    if not stock_data:
-        return False
-    
-    if not ignored_rarities:
-        return True
-    
-    # Проверяем, есть ли хоть одно растение с неигнорируемой редкостью
-    for plant in stock_data.keys():
-        rarity = PLANTS_RARITY.get(plant)
-        if rarity not in ignored_rarities:
-            return True
-    
-    return False
+def add_user(chat_id):
+    """Добавляет пользователя в БД"""
+    if db.add_user(chat_id):
+        user_chat_ids.add(chat_id)
+        print(f"👤 Добавлен новый пользователь: {chat_id}")
 
 # === ВРЕМЕННЫЕ НАСТРОЙКИ ДЛЯ РЕДАКТИРОВАНИЯ ===
 temp_settings = {}
@@ -169,7 +134,7 @@ temp_settings = {}
 def get_temp_settings(user_id):
     """Получает временные настройки пользователя"""
     if user_id not in temp_settings:
-        # Копируем текущие настройки во временные
+        # Копируем текущие настройки из БД во временные
         current_settings = get_user_settings(user_id)
         temp_settings[user_id] = current_settings.copy()
     return temp_settings[user_id]
@@ -179,7 +144,7 @@ def save_temp_settings(user_id, new_settings):
     temp_settings[user_id] = new_settings
 
 def apply_temp_settings(user_id):
-    """Применяет временные настройки как постоянные"""
+    """Применяет временные настройки как постоянные в БД"""
     if user_id in temp_settings:
         update_user_settings(user_id, temp_settings[user_id])
         # Удаляем временные настройки после применения
@@ -206,7 +171,7 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Показывает меню настроек"""
     user_id = update.effective_user.id
     
-    # Получаем временные настройки (не сохраняем в файл пока не подтвердят)
+    # Получаем временные настройки (не сохраняем в БД пока не подтвердят)
     user_settings = get_temp_settings(user_id)
     ignored_rarities = user_settings.get("ignored_rarities", [])
     
@@ -264,7 +229,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
         await test_user_filter(update, context)
         
     elif data == "confirm_changes":
-        # Подтверждаем изменения и сохраняем настройки
+        # Подтверждаем изменения и сохраняем настройки в БД
         if apply_temp_settings(user_id):
             user_settings = get_user_settings(user_id)
             ignored_count = len(user_settings.get("ignored_rarities", []))
@@ -317,7 +282,37 @@ async def test_user_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.callback_query.message.reply_text("❌ Не удалось получить сток")
 
-# === ОБНОВЛЕННЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С ФИЛЬТРАМИ ===
+# === ФИЛЬТРАЦИЯ СТОКА ===
+def filter_stock_by_settings(stock_data, ignored_rarities):
+    """Фильтрует сток по игнорируемым редкостям"""
+    if not ignored_rarities:
+        return stock_data
+    
+    filtered_stock = {}
+    for plant, stock in stock_data.items():
+        rarity = PLANTS_RARITY.get(plant)
+        if rarity not in ignored_rarities:
+            filtered_stock[plant] = stock
+    
+    return filtered_stock
+
+def should_notify_user(stock_data, ignored_rarities):
+    """Определяет, нужно ли уведомлять пользователя"""
+    if not stock_data:
+        return False
+    
+    if not ignored_rarities:
+        return True
+    
+    # Проверяем, есть ли хоть одно растение с неигнорируемой редкостью
+    for plant in stock_data.keys():
+        rarity = PLANTS_RARITY.get(plant)
+        if rarity not in ignored_rarities:
+            return True
+    
+    return False
+
+# === ОСНОВНЫЕ ФУНКЦИИ БОТА ===
 async def send_telegram_alert_to_all(stock_data):
     """Отправляет уведомления всем пользователям с учетом их настроек"""
     if not user_chat_ids:
@@ -328,7 +323,7 @@ async def send_telegram_alert_to_all(stock_data):
     
     tasks = []
     for chat_id in list(user_chat_ids):
-        # Используем только сохраненные настройки (не временные)
+        # Используем только сохраненные настройки из БД
         user_settings = get_user_settings(chat_id)
         ignored_rarities = user_settings.get("ignored_rarities", [])
         
@@ -353,7 +348,6 @@ async def send_telegram_alert_to_all(stock_data):
             else:
                 sent_count += 1
         
-        save_users()
         print(f"📊 Рассылка завершена: отправлено {sent_count} сообщений")
     else:
         print("🔇 Нет пользователей для уведомления")
@@ -375,7 +369,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     add_user(update.message.chat_id)
     
-    # Используем только сохраненные настройки (не временные)
+    # Используем только сохраненные настройки из БД
     user_settings = get_user_settings(user_id)
     ignored_rarities = user_settings.get("ignored_rarities", [])
     
@@ -427,16 +421,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Используй кнопки для навигации 🎯", reply_markup=keyboard)
 
-# === ФИКС ДЛЯ ASYNCIO ===
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ошибки"""
-    error_msg = str(context.error)
-    # Игнорируем ошибки event loop чтобы не засорять логи
-    if "event loop" in error_msg.lower() or "runtimeerror" in error_msg.lower():
+# === КОМАНДЫ АДМИНИСТРАТОРА ===
+async def admin_broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Рассылка сообщения всем пользователям"""
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /all <сообщение>")
         return
-    print(f"❌ Ошибка бота: {context.error}")
+    
+    message_text = " ".join(context.args)
+    broadcast_message = f"📢 **ОБЪЯВЛЕНИЕ:**\n\n{message_text}"
+    
+    print(f"🔄 Начинаю рассылку сообщения для {len(user_chat_ids)} пользователей...")
+    
+    tasks = []
+    for chat_id in list(user_chat_ids):
+        tasks.append(send_broadcast_message(context, chat_id, broadcast_message))
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    sent_count = sum(1 for r in results if not isinstance(r, Exception))
+    error_count = len(results) - sent_count
+    
+    await update.message.reply_text(
+        f"📊 Рассылка завершена:\n✅ Отправлено: {sent_count}\n❌ Ошибок: {error_count}"
+    )
 
-# === НОВАЯ ФУНКЦИЯ ДЛЯ ПОЛУЧЕНИЯ ПОСЛЕДНЕГО СТОКА ===
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика бота"""
+    stats = db.get_user_stats()
+    
+    text = f"""
+📊 *СТАТИСТИКА БОТА*
+
+👥 Всего пользователей: {stats.get('total_users', 0)}
+⚙️ С настройками: {stats.get('users_with_settings', 0)}
+🔔 Без настроек: {stats.get('users_without_settings', 0)}
+
+💾 База данных: ✅ PostgreSQL 17
+🔄 Активных: {len(user_chat_ids)}
+    """
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def send_broadcast_message(context, chat_id, message):
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode='Markdown'
+        )
+        return True
+    except:
+        return False
+
+# === DISCORD МОНИТОРИНГ ===
 def get_latest_stock():
     """Получает последний известный сток (ищет в истории сообщений если нужно)"""
     global current_stock, last_restock_time, last_stock_message_id
@@ -446,9 +484,17 @@ def get_latest_stock():
         print("📊 Используем сток из памяти")
         return current_stock, last_restock_time
     
+    # Пробуем получить из БД
+    stock_data, time_info = db.get_latest_stock()
+    if stock_data:
+        print("📊 Используем сток из БД")
+        current_stock = stock_data
+        last_restock_time = time_info
+        return stock_data, time_info
+    
     # Иначе ищем сток в Discord
     print("🔍 Ищем сток в Discord...")
-    messages = get_discord_messages(limit=10)  # Смотрим последние 10 сообщений
+    messages = get_discord_messages(limit=10)
     
     for message in messages:
         embeds = message.get('embeds', [])
@@ -462,12 +508,13 @@ def get_latest_stock():
                     current_stock = stock_data
                     last_restock_time = time_info
                     last_stock_message_id = message['id']
+                    # Сохраняем в БД
+                    db.save_current_stock(stock_data, time_info, message['id'])
                     return stock_data, time_info
     
     print("❌ Сток не найден в истории")
     return None, None
 
-# === ИСПРАВЛЕННАЯ ФУНКЦИЯ МОНИТОРИНГА ===
 def monitor_discord():
     global current_stock, last_restock_time, last_message_id, last_stock_message_id
     
@@ -507,7 +554,10 @@ def monitor_discord():
                                 last_restock_time = time_info
                                 last_stock_message_id = current_message_id
                                 
-                                # Запускаем рассылку в отдельном потоке
+                                # СОХРАНЯЕМ В БД
+                                db.save_current_stock(stock_data, time_info, current_message_id)
+                                
+                                # Запускаем рассылку
                                 threading.Thread(
                                     target=lambda: asyncio.run(send_telegram_alert_to_all(stock_data)),
                                     daemon=True
@@ -523,7 +573,7 @@ def monitor_discord():
             print(f"❌ Ошибка мониторинга: {e}")
             time.sleep(30)
 
-# === ИСПРАВЛЕННАЯ ФУНКЦИЯ ПРОВЕРКИ ПОДПИСКИ ===
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 async def check_subscription(user_id):
     """Проверяет, подписан ли пользователь на канал"""
     max_retries = 2
@@ -536,13 +586,11 @@ async def check_subscription(user_id):
                 return False
         except Exception as e:
             error_msg = str(e)
-            # Если это ошибка event loop, пробуем еще раз после задержки
             if "event loop" in error_msg.lower() or "runtimeerror" in error_msg.lower():
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
                     continue
                 print(f"⚠️ Ошибка асинхронности для пользователя {user_id} после {max_retries} попыток")
-                # Возвращаем True чтобы не блокировать пользователя
                 return True
             else:
                 print(f"❌ Ошибка проверки подписки для пользователя {user_id}: {e}")
@@ -556,7 +604,7 @@ def create_subscription_message():
 
 📢 Подпишитесь на канал и получайте:
 • Уведомления о новом стоке
-• Актуальную информацию о растенияи
+• Актуальную информацию о растениях
 • Обновления первыми
     """
     
@@ -609,32 +657,43 @@ async def show_current_stock(user_id, context):
             reply_markup=keyboard
         )
 
-def load_users():
-    global user_chat_ids
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_subscribed = await check_subscription(user_id)
+    
+    if not is_subscribed:
+        text, reply_markup = create_subscription_message()
+        await update.message.reply_text(
+            "👋 Добро пожаловать!\n\n" + text,
+            reply_markup=reply_markup
+        )
+        return
+    
+    add_user(update.message.chat_id)
+    
+    welcome_text = """
+🤖 Бот для отслеживания стока Plants Vs Brainrots
+
+🎯 Нажми кнопку чтобы узнать текущий сток
+⚙️ Настрой уведомления по редкостям
+📢 Канал: @PlantsVersusBrainrotsSTOCK
+💬 Чат: @PlantsVersusBrainrotSTOCKCHAT
+    """
+    await update.message.reply_text(welcome_text, reply_markup=keyboard)
+
+async def send_single_message(chat_id, message):
     try:
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, 'r') as f:
-                data = json.load(f)
-                user_chat_ids = set(data.get('users', []))
-                print(f"📊 Загружено {len(user_chat_ids)} пользователей")
-    except:
-        user_chat_ids = set()
-        print("❌ Ошибка загрузки пользователей")
+        await telegram_bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode='Markdown'
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка отправки пользователю {chat_id}: {e}")
+        return False
 
-def save_users():
-    try:
-        with open(USERS_FILE, 'w') as f:
-            json.dump({'users': list(user_chat_ids)}, f)
-        print(f"💾 Сохранено {len(user_chat_ids)} пользователей")
-    except:
-        print("❌ Ошибка сохранения пользователей")
-
-def add_user(chat_id):
-    if chat_id not in user_chat_ids:
-        user_chat_ids.add(chat_id)
-        save_users()
-        print(f"👤 Добавлен новый пользователь: {chat_id}")
-
+# === DISCORD API ФУНКЦИИ ===
 def get_latest_discord_message():
     headers = {
         'Authorization': DISCORD_USER_TOKEN,
@@ -759,82 +818,20 @@ def create_telegram_message(stock_data, time_info, is_alert=False):
     
     return message_text
 
-# === ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТПРАВКИ ===
-async def send_single_message(chat_id, message):
-    try:
-        # Пропускаем проверку подписки в рассылке чтобы избежать ошибок асинхронности
-        await telegram_bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode='Markdown'
-        )
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка отправки пользователю {chat_id}: {e}")
-        return False
-
-async def admin_broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /ALL <сообщение>")
+# === ОБРАБОТКА ОШИБОК ===
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ошибки"""
+    error_msg = str(context.error)
+    if "event loop" in error_msg.lower() or "runtimeerror" in error_msg.lower():
         return
-    
-    message_text = " ".join(context.args)
-    broadcast_message = f"📢 **ОБЪЯВЛЕНИЕ:**\n\n{message_text}"
-    
-    print(f"🔄 Начинаю рассылку сообщения для {len(user_chat_ids)} пользователей...")
-    
-    tasks = []
-    for chat_id in list(user_chat_ids):
-        tasks.append(send_broadcast_message(context, chat_id, broadcast_message))
-    
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    sent_count = sum(1 for r in results if not isinstance(r, Exception))
-    error_count = len(results) - sent_count
-    
-    await update.message.reply_text(
-        f"📊 Рассылка завершена:\n✅ Отправлено: {sent_count}\n❌ Ошибок: {error_count}"
-    )
+    print(f"❌ Ошибка бота: {context.error}")
 
-async def send_broadcast_message(context, chat_id, message):
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode='Markdown'
-        )
-        return True
-    except:
-        return False
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    is_subscribed = await check_subscription(user_id)
-    
-    if not is_subscribed:
-        text, reply_markup = create_subscription_message()
-        await update.message.reply_text(
-            "👋 Добро пожаловать!\n\n" + text,
-            reply_markup=reply_markup
-        )
-        return
-    
-    add_user(update.message.chat_id)
-    
-    welcome_text = """
-🤖 Бот для отслеживания стока Plants Vs Brainrots
-
-🎯 Нажми кнопку чтобы узнать текущий сток
-⚙️ Настрой уведомления по редкостям
-📢 Канал: @PlantsVersusBrainrotsSTOCK
-💬 Чат: @PlantsVersusBrainrotSTOCKCHAT
-    """
-    await update.message.reply_text(welcome_text, reply_markup=keyboard)
-
+# === ЗАПУСК БОТА ===
 def run_telegram_bot():
     print("📱 Запускаем Telegram бота...")
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("all", admin_broadcast_command))
+    telegram_app.add_handler(CommandHandler("stats", stats_command))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     telegram_app.add_handler(CallbackQueryHandler(handle_subscription_check, pattern="check_subscription"))
     telegram_app.add_handler(CallbackQueryHandler(handle_settings_callback, pattern="^(toggle_|test_filter|confirm_changes)"))
@@ -845,11 +842,13 @@ def main():
     print("🚀 ЗАПУСКАЕМ БОТА PLANTS VS BRAINROTS!")
     print("=" * 50)
     print("🤖 Бот для отслеживания стока растений")
-    print("⚙️ Система фильтрации по редкостям")
+    print("⚙️ Система фильтрации по редкостям") 
+    print("🗄️ База данных: PostgreSQL 17")
     print("📊 Мониторинг Discord канала")
     print("🔔 Умные уведомления о новом стоке")
     print("=" * 50)
     
+    # Загружаем пользователей из БД
     load_users()
     
     print("🌀 Запускаем мониторинг Discord...")
