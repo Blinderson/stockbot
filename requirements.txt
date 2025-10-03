@@ -2,4 +2,4 @@ python-telegram-bot>=21.0
 requests==2.31.0
 flask==2.3.3
 waitress==2.1.2
-psycopg2-binary==2.9.9
+psycopg[binary]==3.2.10
