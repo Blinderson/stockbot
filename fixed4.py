@@ -25,8 +25,11 @@ def health():
 
 def run_health_server():
     try:
-        print("🏥 Starting health check server on port 8080...")
-        app.run(host='0.0.0.0', port=8080, debug=False)
+        port = int(os.environ.get('PORT', 8080))
+        print(f"🏥 Starting health check server on port {port}...")
+        # Убираем предупреждение используя production-ready сервер
+        from waitress import serve
+        serve(app, host='0.0.0.0', port=port)
     except Exception as e:
         print(f"❌ Health server error: {e}")
 
@@ -553,7 +556,7 @@ def create_subscription_message():
 
 📢 Подпишитесь на канал и получайте:
 • Уведомления о новом стоке
-• Актуальную информацию о растениях
+• Актуальную информацию о растенияи
 • Обновления первыми
     """
     
